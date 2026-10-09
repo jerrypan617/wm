@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -17,6 +17,7 @@ from wm.world_model.data import (  # noqa: E402
     TransitionDataset,
     WorldModelVocab,
     load_transition_records,
+    split_indices_by_episode,
 )
 from wm.world_model.model import QwenWorldModel  # noqa: E402
 
@@ -62,7 +63,14 @@ def _run_epoch(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the Qwen ALFWorld world model")
     parser.add_argument("--dataset", required=True)
-    parser.add_argument("--vocab", required=True)
+    parser.add_argument(
+        "--vocab",
+        help="optional prebuilt vocabulary; omit to build it from train episodes only",
+    )
+    parser.add_argument(
+        "--vocab-output",
+        help="optional path for saving the vocabulary used in this checkpoint",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--model-id", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--cache-dir", default="cache")
@@ -114,15 +122,36 @@ def main() -> None:
         records = random.sample(records, args.max_samples)
     if len(records) < 2:
         raise SystemExit("At least two transitions are required")
-    vocab = WorldModelVocab.load(args.vocab)
-    dataset = TransitionDataset(records, vocab)
-    val_size = max(1, int(len(dataset) * args.val_ratio))
-    train_size = len(dataset) - val_size
-    train_set, val_set = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(args.seed),
+    train_indices, val_indices = split_indices_by_episode(
+        records,
+        validation_ratio=args.val_ratio,
+        seed=args.seed,
     )
+    train_episodes = sorted({records[index].episode_id for index in train_indices})
+    validation_episodes = sorted({records[index].episode_id for index in val_indices})
+    print(
+        json.dumps(
+            {
+                "train_transitions": len(train_indices),
+                "validation_transitions": len(val_indices),
+                "train_episodes": len(train_episodes),
+                "validation_episodes": len(validation_episodes),
+                "seed": args.seed,
+            },
+            ensure_ascii=False,
+        )
+    )
+    train_records = [records[index] for index in train_indices]
+    vocab = (
+        WorldModelVocab.load(args.vocab)
+        if args.vocab
+        else WorldModelVocab.build(train_records)
+    )
+    if args.vocab_output:
+        vocab.save(args.vocab_output)
+    dataset = TransitionDataset(records, vocab)
+    train_set = Subset(dataset, train_indices)
+    val_set = Subset(dataset, val_indices)
     train_loader = DataLoader(dataset=train_set, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(dataset=val_set, batch_size=args.batch_size, shuffle=False)
 
@@ -178,6 +207,12 @@ def main() -> None:
             "vocab": vocab.to_dict(),
             "heads": model.head_state_dict(),
             "history": history,
+            "data_split": {
+                "seed": args.seed,
+                "validation_ratio": args.val_ratio,
+                "train_episode_ids": train_episodes,
+                "validation_episode_ids": validation_episodes,
+            },
         },
         output,
     )

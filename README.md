@@ -98,6 +98,91 @@ each decision and records `world_model_calls`, `world_model_overrides`, and
 evaluation therefore distinguishes an actually used world model from a
 checkpoint that was merely loaded.
 
+## Belief-aware EFE experiment
+
+The research prototype keeps the DeepSeek policy and Qwen World Model
+separate. At each decision it asks the policy for a proposal, adds a bounded
+set of admissible goal-relevant and inspection actions, predicts their next
+fact marginals with the World Model, and minimizes:
+
+```text
+G(a) = - task_progress(a)
+       - beta * discounted_expected_information_gain(a)
+       + action_cost(a)
+       + revisit_penalty(a)
+```
+
+It executes only the selected primitive action and replans from the next real
+observation. A surface inspection is modeled as one step; inspecting a closed
+container is estimated as a two-step `go to` → `open` probe (one step if the
+agent already knows that container is open), so its information value is
+discounted and carried until the contents are observed.
+
+Important scope note: the current World Model predicts factorized structured
+fact probabilities; those marginals are not a calibrated joint belief over
+hidden environments. Therefore the first EIG term is an explicit,
+task-relevant target-location belief: a uniform approximation over which
+uninspected admissible locations contain the required object. Empty inventories
+remove locations; observing a target updates the remaining count. This is a
+useful engineering proxy, not a claim that the World Model has calibrated
+parameter uncertainty. The design and assumptions are documented in
+[`docs/architecture/adr-001-belief-aware-efe-planner.md`](docs/architecture/adr-001-belief-aware-efe-planner.md).
+
+Train the World Model on the ALFWorld `train` split and keep validation splits
+held out. The trainer now assigns complete episodes to either train or
+validation, avoiding leakage between adjacent transitions. It also builds the
+vocabulary from training episodes if `--vocab` is omitted:
+
+```bash
+uv run python scripts/train_world_model.py \
+  --dataset data/world_model_train.jsonl \
+  --cache-dir cache \
+  --output checkpoints/qwen35_world_model.pt \
+  --vocab-output checkpoints/qwen35_world_model_vocab.json
+```
+
+QLoRA is enabled by default and needs CUDA. For a full-precision frozen-backbone
+run on a machine without CUDA, add `--no-qlora` (subject to available memory).
+
+Start with a small matched comparison. The policy-only baseline and EFE system
+must both use `admissible` actions so action validity is not credited to the
+World Model:
+
+```bash
+# Baseline: DeepSeek policy with the same legal-action constraint
+uv run wm-eval eval \
+  --config configs/experiments/valid_seen_deepseek_admissible.yaml \
+  --action-space admissible --num-episodes 5 \
+  --output-dir results/ablation/seen_policy_only
+
+# Full system: task progress + expected information gain + costs
+uv run python scripts/run_efe_eval.py \
+  --config configs/experiments/valid_seen_deepseek_efe.yaml \
+  --world-model-checkpoint checkpoints/qwen35_world_model.pt \
+  --cache-dir cache --num-episodes 5
+
+# Ablation: learned task progress, but no information-seeking bonus
+uv run python scripts/run_efe_eval.py \
+  --config configs/experiments/valid_seen_deepseek_efe.yaml \
+  --world-model-checkpoint checkpoints/qwen35_world_model.pt \
+  --cache-dir cache --num-episodes 5 \
+  --information-gain-weight 0
+```
+
+Matched policy-only configs are `valid_seen_deepseek_admissible.yaml` and
+`valid_unseen_deepseek_admissible.yaml`. For the full validation splits, use
+`valid_seen_deepseek_efe.yaml` and `valid_unseen_deepseek_efe.yaml`; add
+`--resume` to continue an interrupted run. The script also accepts
+`--episode-start/--episode-end` for deterministic
+shards and overrides for all EFE weights. Episode JSONL records per-candidate
+scores, predicted progress, expected and realized information gain; summary
+JSON reports success/steps, invalid actions, consecutive action repeats, and
+navigation revisits, and probe IG prediction error. Use `--progress-weight 0`
+to isolate the location information term, and compare all variants on
+identical episode IDs. For independent episode-range shards, give each run a
+separate output directory and merge the resulting JSONL files with
+`scripts/merge_eval_results.py`.
+
 ## Qwen world model
 
 The project includes a structured, action-conditioned world-model prototype.

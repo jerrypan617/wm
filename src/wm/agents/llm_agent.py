@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from wm.models.base import GenerationConfig, ModelBackend
@@ -15,6 +15,7 @@ class AgentResponse:
     action: str
     raw_response: str
     user_prompt: str
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 class LLMTextAgent:

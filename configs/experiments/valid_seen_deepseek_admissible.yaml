@@ -1,0 +1,6 @@
+model_config: ../models/deepseek_reasoner.yaml
+environment_config: ../environments/alfworld_textworld.yaml
+split: valid_seen
+num_episodes: -1
+action_space: admissible
+output_dir: results/deepseek_reasoner_admissible

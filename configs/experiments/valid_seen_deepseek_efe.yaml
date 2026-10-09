@@ -1,0 +1,19 @@
+model_config: ../models/deepseek_reasoner.yaml
+environment_config: ../environments/alfworld_textworld.yaml
+split: valid_seen
+num_episodes: -1
+action_space: admissible
+output_dir: results/deepseek_reasoner_efe
+
+# All terms are minimized together as expected free energy:
+#   G(a) = -progress_weight * predicted_task_progress
+#          -information_gain_weight * expected_information_gain
+#          +action_cost_weight * estimated_primitive_steps
+efe:
+  progress_weight: 1.0
+  information_gain_weight: 0.35
+  action_cost_weight: 0.15
+  revisit_penalty: 0.25
+  horizon_discount: 0.8
+  max_candidates: 12
+  max_location_candidates: 5

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -119,6 +120,40 @@ def load_transition_records(path: str | Path) -> list[TransitionRecord]:
         for line in input_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def split_indices_by_episode(
+    records: Sequence[TransitionRecord],
+    *,
+    validation_ratio: float,
+    seed: int = 0,
+) -> tuple[list[int], list[int]]:
+    """Split transition indices by episode, preventing adjacent-transition leakage."""
+
+    if not 0.0 < validation_ratio < 1.0:
+        raise ValueError("validation_ratio must be strictly between 0 and 1")
+    groups: dict[int, list[int]] = {}
+    for index, record in enumerate(records):
+        if record.episode_id < 0:
+            raise ValueError(
+                "Episode-level validation requires non-negative episode_id values"
+            )
+        groups.setdefault(record.episode_id, []).append(index)
+    if len(groups) < 2:
+        raise ValueError("At least two distinct episodes are required for validation")
+
+    episode_ids = sorted(groups)
+    random.Random(seed).shuffle(episode_ids)
+    validation_episode_count = max(1, round(len(episode_ids) * validation_ratio))
+    validation_episode_count = min(validation_episode_count, len(episode_ids) - 1)
+    validation_episodes = set(episode_ids[:validation_episode_count])
+
+    train_indices: list[int] = []
+    validation_indices: list[int] = []
+    for episode_id, indices in groups.items():
+        target = validation_indices if episode_id in validation_episodes else train_indices
+        target.extend(indices)
+    return sorted(train_indices), sorted(validation_indices)
 
 
 @dataclass

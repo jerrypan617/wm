@@ -125,10 +125,17 @@ class EvaluationRunner:
                 with environment_lock:
                     observation, info = environment.reset()
             initial_observation = observation
+            reset_episode = getattr(agent, "reset_episode", None)
+            if callable(reset_episode):
+                reset_episode(
+                    initial_observation,
+                    environment.admissible_commands(info),
+                )
             turns: list[tuple[str, str]] = []
             actions: list[str] = []
             raw_responses: list[str] = []
             observations: list[str] = [observation]
+            decision_diagnostics: list[dict[str, Any]] = []
             structured_states: list[dict[str, Any]] = [
                 parse_observation(observation).to_dict()
             ]
@@ -152,6 +159,20 @@ class EvaluationRunner:
                 else:
                     with environment_lock:
                         step = environment.step(response.action)
+                transition_diagnostics: dict[str, Any] = {}
+                observe_transition = getattr(agent, "observe_transition", None)
+                if callable(observe_transition):
+                    try:
+                        transition_diagnostics = observe_transition(
+                            response.action, step.observation
+                        )
+                    except Exception as exc:
+                        transition_diagnostics = {
+                            "diagnostic_update_error_type": type(exc).__name__
+                        }
+                decision_diagnostics.append(
+                    {**response.diagnostics, **transition_diagnostics}
+                )
                 actions.append(response.action)
                 raw_responses.append(response.raw_response)
                 observations.append(step.observation)
@@ -179,6 +200,7 @@ class EvaluationRunner:
                 raw_responses=raw_responses,
                 observations=observations,
                 structured_states=structured_states,
+                decision_diagnostics=decision_diagnostics,
             )
             results.append(result)
             if self.on_episode_complete is not None:
