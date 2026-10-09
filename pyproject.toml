@@ -1,0 +1,45 @@
+[project]
+name = "wm"
+version = "0.1.0"
+description = "A small, reproducible framework for language-model environment evaluation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "alfworld",
+    "huggingface-hub",
+    "pyyaml",
+    "torch==2.11.0+cu128; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchvision==0.26.0+cu128; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torch; sys_platform != 'linux' or platform_machine != 'x86_64'",
+    "torchvision; sys_platform != 'linux' or platform_machine != 'x86_64'",
+    "transformers",
+    "peft>=0.17.0",
+    "bitsandbytes>=0.46.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flash-linear-attention>=0.5.2",
+    "datasets",
+    "accelerate",
+    "tqdm",
+]
+
+[tool.uv]
+package = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+
+[project.scripts]
+wm-eval = "wm.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13.0"]
+build-backend = "uv_build"

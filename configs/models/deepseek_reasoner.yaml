@@ -1,0 +1,11 @@
+name: deepseek_reasoner
+backend: deepseek
+model_id: deepseek-reasoner
+api_key_env: DEEPSEEK_API_KEY
+timeout: 180
+max_retries: 5
+
+# max_tokens includes the hidden reasoning tokens and the final command.
+generation:
+  max_new_tokens: 2048
+  top_p: 1.0

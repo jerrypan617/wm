@@ -1,0 +1,5 @@
+name: admissible_action
+description: Choose one action from the environment's admissible commands.
+action_space: admissible
+temperature: 0.0
+enable_thinking: false

@@ -1,0 +1,5 @@
+name: free_action
+description: Generate one action without exposing admissible commands.
+action_space: free
+temperature: 0.0
+enable_thinking: false

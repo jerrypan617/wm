@@ -1,0 +1,14 @@
+name: deepseek_chat
+backend: deepseek
+model_id: deepseek-chat
+api_key_env: DEEPSEEK_API_KEY
+timeout: 120
+max_retries: 5
+
+generation:
+  max_new_tokens: 128
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 20
+  do_sample: false
+  enable_thinking: false

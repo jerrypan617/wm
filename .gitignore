@@ -1,0 +1,56 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments and local tooling
+.venv/
+.direnv/
+.idea/
+.vscode/
+
+# Hugging Face model cache and downloaded assets
+cache/
+.cache/
+huggingface_cache/
+
+# Experiment outputs and runtime logs
+results/*
+!results/.gitkeep
+logs/*
+!logs/.gitkeep
+tmp/*
+wandb/
+mlruns/
+tensorboard/
+*.log
+
+# World-model datasets, generated artifacts, and trained checkpoints
+data/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.gguf
+
+# API credentials
+.env
+.env.*
+!.env.example
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
