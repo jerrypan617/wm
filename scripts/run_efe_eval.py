@@ -67,6 +67,19 @@ def main() -> None:
     parser.add_argument("--action-cost-weight", type=float, default=None)
     parser.add_argument("--revisit-penalty", type=float, default=None)
     parser.add_argument("--horizon-discount", type=float, default=None)
+    parser.add_argument("--override-margin", type=float, default=None)
+    parser.add_argument("--online-vfe", action="store_true", default=None)
+    parser.add_argument("--online-vfe-lr", type=float, default=None)
+    parser.add_argument("--online-vfe-beta", type=float, default=None)
+    parser.add_argument("--online-vfe-state-positive-weight", type=float, default=None)
+    parser.add_argument("--online-vfe-gradient-clip-norm", type=float, default=None)
+    parser.add_argument("--online-vfe-steps", type=int, default=None)
+    parser.add_argument(
+        "--online-vfe-scope",
+        choices=["all", "heads", "transition"],
+        default=None,
+    )
+    parser.add_argument("--online-vfe-update-interval", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
@@ -83,11 +96,44 @@ def main() -> None:
         "action_cost_weight": float(efe_config.get("action_cost_weight", 0.15)),
         "revisit_penalty": float(efe_config.get("revisit_penalty", 0.25)),
         "horizon_discount": float(efe_config.get("horizon_discount", 0.8)),
+        "override_margin": float(efe_config.get("override_margin", 0.10)),
     }
     for key in efe_settings:
         override = getattr(args, key)
         if override is not None:
             efe_settings[key] = override
+    online_vfe_config = dict(experiment.get("online_vfe", {}))
+    online_vfe_enabled = (
+        bool(args.online_vfe)
+        if args.online_vfe is not None
+        else bool(online_vfe_config.get("enabled", False))
+    )
+    online_vfe_settings = {
+        "enabled": online_vfe_enabled,
+        "learning_rate": float(online_vfe_config.get("learning_rate", 1e-5)),
+        "beta": float(online_vfe_config.get("beta", 1.0)),
+        "state_positive_weight": float(
+            online_vfe_config.get("state_positive_weight", 10.0)
+        ),
+        "gradient_clip_norm": float(
+            online_vfe_config.get("gradient_clip_norm", 1.0)
+        ),
+        "steps": int(online_vfe_config.get("steps", 1)),
+        "scope": str(online_vfe_config.get("scope", "all")),
+        "update_interval": int(online_vfe_config.get("update_interval", 1)),
+    }
+    online_vfe_overrides = {
+        "learning_rate": args.online_vfe_lr,
+        "beta": args.online_vfe_beta,
+        "state_positive_weight": args.online_vfe_state_positive_weight,
+        "gradient_clip_norm": args.online_vfe_gradient_clip_norm,
+        "steps": args.online_vfe_steps,
+        "scope": args.online_vfe_scope,
+        "update_interval": args.online_vfe_update_interval,
+    }
+    for key, override in online_vfe_overrides.items():
+        if override is not None:
+            online_vfe_settings[key] = override
     split = args.split or experiment.get("split", "valid_seen")
     requested_episodes = (
         args.num_episodes
@@ -132,6 +178,9 @@ def main() -> None:
         "world_model_calls": 0,
         "world_model_errors": 0,
         "planner_decisions": 0,
+        "online_vfe_updates": 0,
+        "online_vfe_errors": 0,
+        "online_vfe_loss_sum": 0.0,
     }
     if args.resume and stats_path.is_file():
         stats.update(json.loads(stats_path.read_text(encoding="utf-8")))
@@ -194,10 +243,29 @@ def main() -> None:
                 action_cost_weight=efe_settings["action_cost_weight"],
                 revisit_penalty=efe_settings["revisit_penalty"],
                 horizon_discount=efe_settings["horizon_discount"],
+                override_margin=efe_settings["override_margin"],
+                online_vfe=online_vfe_enabled,
+                online_vfe_beta=online_vfe_settings["beta"],
+                online_vfe_state_positive_weight=online_vfe_settings[
+                    "state_positive_weight"
+                ],
+                online_vfe_gradient_clip_norm=online_vfe_settings[
+                    "gradient_clip_norm"
+                ],
+                online_vfe_steps=online_vfe_settings["steps"],
+                online_vfe_update_interval=online_vfe_settings["update_interval"],
             )
+            if online_vfe_enabled:
+                agent.world_model.enable_online_vfe(
+                    online_vfe_settings["learning_rate"],
+                    parameter_scope=online_vfe_settings["scope"],
+                )
             agent.world_model_calls = int(stats["world_model_calls"])
             agent.world_model_errors = int(stats["world_model_errors"])
             agent.planner_decisions = int(stats["planner_decisions"])
+            agent.online_vfe_updates = int(stats["online_vfe_updates"])
+            agent.online_vfe_errors = int(stats["online_vfe_errors"])
+            agent.online_vfe_loss_sum = float(stats["online_vfe_loss_sum"])
 
             def save_checkpoint(result: Any) -> None:
                 completed_by_id[result.episode_id] = result
@@ -210,6 +278,9 @@ def main() -> None:
                         "world_model_calls": agent.world_model_calls,
                         "world_model_errors": agent.world_model_errors,
                         "planner_decisions": agent.planner_decisions,
+                        "online_vfe_updates": agent.online_vfe_updates,
+                        "online_vfe_errors": agent.online_vfe_errors,
+                        "online_vfe_loss_sum": agent.online_vfe_loss_sum,
                     }
                 )
                 write_json(stats_path, stats)
@@ -227,6 +298,9 @@ def main() -> None:
                     "world_model_calls": agent.world_model_calls,
                     "world_model_errors": agent.world_model_errors,
                     "planner_decisions": agent.planner_decisions,
+                    "online_vfe_updates": agent.online_vfe_updates,
+                    "online_vfe_errors": agent.online_vfe_errors,
+                    "online_vfe_loss_sum": agent.online_vfe_loss_sum,
                 }
             )
             all_results = sorted(
@@ -257,6 +331,7 @@ def main() -> None:
             "episode_start": episode_start,
             "episode_end": episode_end,
             "efe": efe_settings,
+            "online_vfe": online_vfe_settings,
             "resumed": bool(args.resume),
             **stats,
             **summary,

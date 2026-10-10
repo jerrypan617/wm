@@ -232,8 +232,29 @@ uv run python scripts/train_world_model.py \
   --output checkpoints/qwen35_world_model.pt
 ```
 
+To record epoch-level VFE metrics for TensorBoard, add a log directory:
+
+```bash
+uv run python scripts/train_world_model.py \
+  --dataset data/world_model_train.jsonl \
+  --vocab data/world_model_vocab.json \
+  --cache-dir cache \
+  --output checkpoints/qwen35_world_model.pt \
+  --tensorboard-logdir tensorboard/qwen35_world_model
+uv run tensorboard --logdir tensorboard
+```
+
 Use `--no-qlora` only for a full-precision frozen-backbone smoke test. The
 resulting checkpoint is not a QLoRA checkpoint.
+
+For a test-time adaptation ablation, use
+`configs/experiments/valid_seen_deepseek_efe_online_vfe.yaml`. The EFE action
+is selected before the environment transition; after the real next
+observation arrives, the evaluator applies one VFE update to the QLoRA
+adapters and structured heads. The checkpoint is restored at the beginning
+of every episode, so adaptation does not carry across test episodes. This is
+an online-adaptation protocol and should be reported separately from the
+fixed-checkpoint EFE result.
 
 Predict the next structured state for one or more candidate actions:
 

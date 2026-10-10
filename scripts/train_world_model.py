@@ -98,6 +98,11 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--tensorboard-logdir",
+        default=None,
+        help="optional TensorBoard event directory; logs epoch-level VFE metrics",
+    )
+    parser.add_argument(
         "--no-qlora",
         action="store_false",
         dest="qlora",
@@ -173,6 +178,19 @@ def main() -> None:
     )
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate)
+    writer = None
+    if args.tensorboard_logdir:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as exc:
+            raise RuntimeError(
+                "TensorBoard logging requires the tensorboard package; run `uv sync`"
+            ) from exc
+        writer = SummaryWriter(log_dir=args.tensorboard_logdir)
+        writer.add_text("config/dataset", str(args.dataset), 0)
+        writer.add_text("config/model_id", str(args.model_id), 0)
+        writer.add_scalar("data/train_transitions", len(train_indices), 0)
+        writer.add_scalar("data/validation_transitions", len(val_indices), 0)
     history: list[dict[str, float | int]] = []
 
     for epoch in range(args.epochs):
@@ -197,7 +215,18 @@ def main() -> None:
         row.update({f"train_{key}": value for key, value in train_metrics.items()})
         row.update({f"val_{key}": value for key, value in val_metrics.items()})
         history.append(row)
+        if writer is not None:
+            step = epoch + 1
+            for metric in ("loss", "reconstruction", "kl", "state_supervision", "transition_supervision"):
+                writer.add_scalar(f"vfe/{metric}", train_metrics[metric], step)
+                writer.add_scalar(f"vfe_val/{metric}", val_metrics[metric], step)
+            writer.add_scalar("training/beta", beta, step)
+            writer.add_scalar("training/learning_rate", args.learning_rate, step)
+            writer.flush()
         print(json.dumps(row, ensure_ascii=False))
+
+    if writer is not None:
+        writer.close()
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

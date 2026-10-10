@@ -125,6 +125,9 @@ class EvaluationRunner:
                 with environment_lock:
                     observation, info = environment.reset()
             initial_observation = observation
+            episode_gamefile = info.get("extra.gamefile")
+            if episode_gamefile is None:
+                episode_gamefile = info.get("gamefile")
             reset_episode = getattr(agent, "reset_episode", None)
             if callable(reset_episode):
                 reset_episode(
@@ -188,11 +191,7 @@ class EvaluationRunner:
             result = EpisodeResult(
                 episode_id=episode_id,
                 split=environment.split,
-                gamefile=(
-                    str(info.get("extra.gamefile"))
-                    if info.get("extra.gamefile") is not None
-                    else None
-                ),
+                gamefile=(str(episode_gamefile) if episode_gamefile is not None else None),
                 success=success,
                 steps=len(actions),
                 invalid_actions=invalid_actions,

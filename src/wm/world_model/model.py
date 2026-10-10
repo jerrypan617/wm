@@ -3,13 +3,15 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+import copy
 from typing import Any, Sequence
 
 import torch
 from torch import nn
 from transformers import AutoModelForMultimodalLM, AutoProcessor
 
-from .data import WorldModelVocab
+from .data import TransitionDataset, TransitionRecord, WorldModelVocab
+from .state import parse_observation
 
 
 DEFAULT_QLORA_TARGET_MODULES = (
@@ -328,6 +330,10 @@ class QwenWorldModel(nn.Module):
             nn.LayerNorm(state_hidden_size),
             nn.Linear(state_hidden_size, len(vocab.observation_words)),
         ).to(model_device)
+        self._online_vfe_initial_state: dict[str, Any] | None = None
+        self._online_vfe_optimizer: torch.optim.Optimizer | None = None
+        self._online_vfe_lr: float | None = None
+        self._online_vfe_parameter_scope: str = "all"
 
     @property
     def device(self) -> torch.device:
@@ -452,6 +458,150 @@ class QwenWorldModel(nn.Module):
         self.transition.load_state_dict(payload["transition"])
         self.observation_decoder.load_state_dict(payload["observation_decoder"])
         self.encoder.load_lora_state_dict(payload.get("encoder_lora", {}))
+
+    def _online_vfe_parameters(self, parameter_scope: str) -> list[nn.Parameter]:
+        if parameter_scope == "all":
+            return [
+                parameter
+                for parameter in self.parameters()
+                if parameter.requires_grad
+            ]
+        if parameter_scope == "heads":
+            modules = (
+                self.posterior,
+                self.action_embedding,
+                self.transition,
+                self.observation_decoder,
+            )
+        elif parameter_scope == "transition":
+            # Keep the observation encoder and posterior fixed.  Updating
+            # only the transition head makes test-time adaptation less likely
+            # to destroy the state representation used by EFE.
+            modules = (self.transition,)
+        else:
+            raise ValueError(
+                "online VFE parameter_scope must be one of: all, heads, transition"
+            )
+        return [parameter for module in modules for parameter in module.parameters()]
+
+    def enable_online_vfe(
+        self,
+        learning_rate: float = 1e-5,
+        *,
+        parameter_scope: str = "all",
+    ) -> None:
+        """Enable resettable test-time VFE updates.
+
+        The initial checkpoint is kept in CPU memory so every episode starts
+        from the same frozen-evaluation model. Only parameters marked
+        trainable (the QLoRA adapters and structured heads) are optimized.
+        """
+
+        if learning_rate <= 0.0:
+            raise ValueError("online VFE learning_rate must be positive")
+        trainable = self._online_vfe_parameters(parameter_scope)
+        if not trainable:
+            raise RuntimeError("online VFE requires trainable QLoRA/head parameters")
+        self._online_vfe_initial_state = copy.deepcopy(self.head_state_dict())
+        self._online_vfe_lr = float(learning_rate)
+        self._online_vfe_parameter_scope = parameter_scope
+        selected = {id(parameter) for parameter in trainable}
+        for parameter in self.parameters():
+            parameter.requires_grad_(id(parameter) in selected)
+        self.reset_online_vfe()
+
+    def reset_online_vfe(self) -> None:
+        """Restore the checkpoint and reset the online optimizer state."""
+
+        if self._online_vfe_initial_state is None or self._online_vfe_lr is None:
+            return
+        self.load_head_state_dict(copy.deepcopy(self._online_vfe_initial_state))
+        trainable = self._online_vfe_parameters(self._online_vfe_parameter_scope)
+        self._online_vfe_optimizer = torch.optim.AdamW(
+            trainable,
+            lr=self._online_vfe_lr,
+        )
+        self.eval()
+
+    def online_vfe_step(
+        self,
+        observation: str,
+        action: str,
+        next_observation: str,
+        *,
+        beta: float = 1.0,
+        state_positive_weight: float = 10.0,
+        gradient_clip_norm: float = 1.0,
+    ) -> dict[str, float]:
+        """Apply one VFE update using one observed environment transition.
+
+        This is deliberately an online adaptation hook for evaluation
+        experiments. It uses only the observation available after the action
+        has executed and updates QLoRA/head parameters, never the 4-bit base
+        weights. The caller is responsible for deciding the test protocol.
+        """
+
+        if self._online_vfe_optimizer is None:
+            raise RuntimeError("Call enable_online_vfe before online_vfe_step")
+        if beta < 0.0 or state_positive_weight <= 0.0:
+            raise ValueError("invalid online VFE loss weights")
+
+        record = TransitionRecord(
+            episode_id=0,
+            step=0,
+            observation=observation,
+            action=action,
+            next_observation=next_observation,
+            state=parse_observation(observation),
+            next_state=parse_observation(next_observation),
+        )
+        sample = TransitionDataset([record], self.vocab)[0]
+        batch: dict[str, Any] = {}
+        for key, value in sample.items():
+            if torch.is_tensor(value):
+                batch[key] = value.unsqueeze(0)
+            else:
+                batch[key] = [value]
+
+        self.train()
+        if self._online_vfe_parameter_scope != "all":
+            # The frozen encoder should stay deterministic during head-only
+            # adaptation; otherwise QLoRA dropout injects noise into the
+            # single-transition target even though the adapters are frozen.
+            self.encoder.eval()
+        # ``optimizer.zero_grad`` only clears parameters owned by the
+        # optimizer.  Clear the whole module first so a parameter excluded by
+        # the selected online scope cannot retain stale gradients from an
+        # earlier transition.
+        self.zero_grad(set_to_none=True)
+        outputs = self(
+            batch["observation"],
+            batch["next_observation"],
+            batch["action"],
+        )
+        losses = self.free_energy(
+            outputs,
+            batch,
+            beta=beta,
+            state_positive_weight=state_positive_weight,
+        )
+        losses["loss"].backward()
+        trainable = self._online_vfe_parameters(self._online_vfe_parameter_scope)
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            trainable, gradient_clip_norm
+        )
+        self._online_vfe_optimizer.step()
+        self.eval()
+        return {
+            "loss": float(losses["loss"].detach().cpu()),
+            "reconstruction": float(losses["reconstruction"].cpu()),
+            "kl": float(losses["kl"].cpu()),
+            "state_supervision": float(losses["state_supervision"].cpu()),
+            "transition_supervision": float(
+                losses["transition_supervision"].cpu()
+            ),
+            "gradient_norm": float(gradient_norm.detach().cpu()),
+        }
 
     @torch.no_grad()
     def predict_next(

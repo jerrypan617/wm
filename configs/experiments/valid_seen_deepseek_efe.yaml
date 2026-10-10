@@ -15,5 +15,8 @@ efe:
   action_cost_weight: 0.15
   revisit_penalty: 0.25
   horizon_discount: 0.8
+  # EFE may override the policy only when stalled and the candidate wins by
+  # at least this margin. Otherwise the DeepSeek proposal is preserved.
+  override_margin: 0.10
   max_candidates: 12
   max_location_candidates: 5

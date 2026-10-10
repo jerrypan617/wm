@@ -24,8 +24,12 @@ the required object.
 
 Keep the policy model and World Model separate. The policy model proposes an
 action; a bounded shortlist is evaluated with the learned World Model and an
-explicit target-location belief. The agent executes only the first primitive
-action, receives the real observation, updates its belief, and replans.
+explicit target-location belief. The policy proposal is preserved by default.
+The EFE selector may override it only when the proposal is a fallback or
+repeated action, or the previous observation made no progress, and only when a
+candidate has a positive predicted-progress margin. The agent executes only
+the first primitive action, receives the real observation, updates its belief,
+and replans.
 
 For `n` uninspected candidate locations and `m` remaining required objects, the
 belief uses a uniform `m`-of-`n` approximation over distinct locations:
@@ -70,6 +74,14 @@ commands are eligible when the matched `admissible` action protocol is enabled.
 - The World Model contributes learned transition/task-progress predictions;
   this first planner is receding-horizon with a short inspection macro, not
   full tree search or a full Bayesian expected-free-energy derivation.
+- Terminal fact scores are supplemented with small admissible-action subgoal
+  bonuses for prerequisite steps such as `take`, `clean`, and `move`; repeated
+  observation actions receive a stall penalty. This prevents an uncertain
+  one-step model from rejecting necessary intermediate actions or selecting an
+  unchanged-observation loop.
+- The conservative gate is intentional: the current transition model is a
+  ranking signal, not a trusted controller. Its validation metrics must be
+  reported alongside any EFE result.
 - Report the value as a task-location expected information gain proxy. Do not
   describe it as calibrated model epistemic uncertainty without additional
   calibration/ensemble experiments.

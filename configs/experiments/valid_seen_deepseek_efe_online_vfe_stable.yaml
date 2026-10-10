@@ -1,0 +1,29 @@
+model_config: ../models/deepseek_reasoner.yaml
+environment_config: ../environments/alfworld_textworld.yaml
+split: valid_seen
+num_episodes: -1
+action_space: admissible
+output_dir: results/deepseek_reasoner/valid_seen_efe_online_vfe_stable
+
+efe:
+  progress_weight: 1.0
+  information_gain_weight: 0.35
+  action_cost_weight: 0.15
+  revisit_penalty: 0.25
+  horizon_discount: 0.8
+  override_margin: 0.10
+  max_candidates: 12
+  max_location_candidates: 5
+
+# Conservative test-time adaptation: keep the Qwen representation and
+# posterior fixed, update only the transition head, and use one update every
+# five observed transitions.
+online_vfe:
+  enabled: true
+  learning_rate: 0.000001
+  beta: 1.0
+  state_positive_weight: 1.0
+  gradient_clip_norm: 0.25
+  steps: 1
+  scope: transition
+  update_interval: 5

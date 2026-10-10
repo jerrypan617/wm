@@ -12,6 +12,10 @@ from .prompt_builder import DEFAULT_SYSTEM_PROMPT
 
 _GO_TO_RE = re.compile(r"^go to\s+(.+)$", re.IGNORECASE)
 _OPEN_RE = re.compile(r"^open\s+(.+)$", re.IGNORECASE)
+_OBSERVATION_ACTION_RE = re.compile(
+    r"^(?:look|examine(?:\s+.+)?|look at(?:\s+.+)?|inventory)$",
+    re.IGNORECASE,
+)
 
 
 class EFEWorldModelAgent(LLMTextAgent):
@@ -19,8 +23,10 @@ class EFEWorldModelAgent(LLMTextAgent):
 
     The policy model proposes an action. A trained action-conditioned world
     model scores a bounded shortlist, while an explicit target-location belief
-    supplies a tractable expected-information-gain term. Only the first
-    primitive action is executed; the agent then observes and replans.
+    supplies a tractable expected-information-gain term. The policy remains
+    the default controller; EFE is a gated tie-breaker/recovery mechanism.
+    Only the first primitive action is executed; the agent then observes and
+    replans.
     """
 
     def __init__(
@@ -38,6 +44,13 @@ class EFEWorldModelAgent(LLMTextAgent):
         action_cost_weight: float = 0.15,
         revisit_penalty: float = 0.25,
         horizon_discount: float = 0.8,
+        override_margin: float = 0.10,
+        online_vfe: bool = False,
+        online_vfe_beta: float = 1.0,
+        online_vfe_state_positive_weight: float = 10.0,
+        online_vfe_gradient_clip_norm: float = 1.0,
+        online_vfe_steps: int = 1,
+        online_vfe_update_interval: int = 1,
     ) -> None:
         super().__init__(
             backend,
@@ -56,6 +69,16 @@ class EFEWorldModelAgent(LLMTextAgent):
             revisit_penalty,
         ) < 0.0:
             raise ValueError("EFE weights and penalties must be non-negative")
+        if override_margin < 0.0:
+            raise ValueError("override_margin must be non-negative")
+        if online_vfe_beta < 0.0 or online_vfe_state_positive_weight <= 0.0:
+            raise ValueError("invalid online VFE loss weights")
+        if online_vfe_gradient_clip_norm <= 0.0 or online_vfe_steps < 1:
+            raise ValueError("invalid online VFE optimization settings")
+        if online_vfe_update_interval < 1:
+            raise ValueError("online_vfe_update_interval must be at least 1")
+        if online_vfe and not callable(getattr(world_model, "online_vfe_step", None)):
+            raise ValueError("online VFE requires a World Model with online_vfe_step")
         self.world_model = world_model
         self.max_candidates = max_candidates
         self.max_location_candidates = max_location_candidates
@@ -64,13 +87,25 @@ class EFEWorldModelAgent(LLMTextAgent):
         self.action_cost_weight = action_cost_weight
         self.revisit_penalty = revisit_penalty
         self.horizon_discount = horizon_discount
+        self.override_margin = override_margin
+        self.online_vfe = online_vfe
+        self.online_vfe_beta = online_vfe_beta
+        self.online_vfe_state_positive_weight = online_vfe_state_positive_weight
+        self.online_vfe_gradient_clip_norm = online_vfe_gradient_clip_norm
+        self.online_vfe_steps = online_vfe_steps
+        self.online_vfe_update_interval = online_vfe_update_interval
         self.goal: GoalSpec | None = None
         self.belief: TargetLocationBelief | None = None
         self._initial_observation: str | None = None
+        self._last_observation: str | None = None
         self._pending_probe: dict[str, Any] | None = None
         self.world_model_calls = 0
         self.world_model_errors = 0
         self.planner_decisions = 0
+        self.online_vfe_updates = 0
+        self.online_vfe_errors = 0
+        self.online_vfe_loss_sum = 0.0
+        self._online_vfe_transition_count = 0
 
     def reset_episode(
         self,
@@ -78,6 +113,12 @@ class EFEWorldModelAgent(LLMTextAgent):
         admissible_commands: list[str] | None = None,
     ) -> None:
         self._initial_observation = initial_observation
+        self._last_observation = initial_observation
+        if self.online_vfe:
+            reset_online_vfe = getattr(self.world_model, "reset_online_vfe", None)
+            if not callable(reset_online_vfe):
+                raise RuntimeError("World Model does not support online VFE reset")
+            reset_online_vfe()
         self.goal = parse_goal(initial_observation)
         self.belief = (
             TargetLocationBelief.from_actions(
@@ -89,6 +130,7 @@ class EFEWorldModelAgent(LLMTextAgent):
             else None
         )
         self._pending_probe = None
+        self._online_vfe_transition_count = 0
         if self.belief is not None:
             self.belief.record_observation(initial_observation)
 
@@ -123,6 +165,82 @@ class EFEWorldModelAgent(LLMTextAgent):
         except (ValueError, IndexError, TypeError):
             pass
         return score
+
+    @staticmethod
+    def _mentions_type(action: str, entity_type_name: str | None) -> bool:
+        if not entity_type_name:
+            return False
+        text = action.lower().replace("_", " ")
+        target = entity_type_name.lower().replace("_", " ")
+        return re.search(rf"\b{re.escape(target)}(?:\s+\d+)?\b", text) is not None
+
+    @classmethod
+    def _subgoal_progress(cls, action: str, goal: GoalSpec | None) -> float:
+        """Reward prerequisite actions that do not yet satisfy the terminal goal.
+
+        The learned state score is intentionally terminal-oriented (for
+        example, ``on_type::object::destination``).  ALFWorld nevertheless
+        requires intermediate actions such as ``take`` before ``move``.  A
+        small, admissible-action shaping term keeps the selector from
+        rejecting those necessary steps when the one-step World Model score is
+        negative.
+        """
+
+        if goal is None:
+            return 0.0
+        lower = action.strip().lower()
+        if lower.startswith(("take ", "pick up ")) and cls._mentions_type(
+            action, goal.object_type
+        ):
+            return 0.45
+        if goal.operation and lower.startswith(f"{goal.operation} ") and cls._mentions_type(
+            action, goal.object_type
+        ):
+            return 1.0
+        if lower.startswith(("move ", "put ")) and cls._mentions_type(
+            action, goal.object_type
+        ) and cls._mentions_type(action, goal.destination_type):
+            return 1.0
+        if goal.task_kind == "inspect" and lower.startswith(("examine ", "look at ")) and cls._mentions_type(
+            action, goal.object_type
+        ):
+            return 0.75
+        return 0.0
+
+    @staticmethod
+    def _previous_observation(
+        initial_observation: str, turns: list[tuple[str, str]]
+    ) -> str | None:
+        """Return the observation before the current one.
+
+        ``turns[-1][1]`` is the current observation in EvaluationRunner, not
+        the previous one.  Using it for a no-progress check would therefore
+        report every step as unchanged.
+        """
+
+        if not turns:
+            return None
+        if len(turns) == 1:
+            return initial_observation
+        return turns[-2][1]
+
+    @staticmethod
+    def _is_observation_action(action: str) -> bool:
+        return _OBSERVATION_ACTION_RE.fullmatch(action.strip()) is not None
+
+    def _is_stalled(
+        self,
+        initial_observation: str,
+        current_observation: str,
+        turns: list[tuple[str, str]],
+    ) -> tuple[bool, str | None]:
+        previous_observation = self._previous_observation(initial_observation, turns)
+        observation_unchanged = (
+            previous_observation is not None
+            and previous_observation == current_observation
+        )
+        previous_action = turns[-1][0] if turns else None
+        return observation_unchanged, previous_action
 
     def _candidate_actions(
         self,
@@ -247,6 +365,7 @@ class EFEWorldModelAgent(LLMTextAgent):
     ) -> AgentResponse:
         if self._initial_observation != initial_observation:
             self.reset_episode(initial_observation, admissible_commands)
+        self._last_observation = current_observation
         if self.belief is not None:
             self.belief.add_candidate_locations(admissible_commands or [])
 
@@ -257,6 +376,12 @@ class EFEWorldModelAgent(LLMTextAgent):
             admissible_commands=admissible_commands,
         )
         admissible = list(admissible_commands or [])
+        observation_unchanged, previous_action = self._is_stalled(
+            initial_observation, current_observation, turns
+        )
+        policy_is_fallback = self._is_observation_action(policy_response.action)
+        policy_repeated = previous_action == policy_response.action
+        stalled = observation_unchanged or policy_is_fallback or policy_repeated
         candidates = self._candidate_actions(
             policy_response.action, admissible, self.belief
         )
@@ -289,73 +414,144 @@ class EFEWorldModelAgent(LLMTextAgent):
                     facts,
                     self.goal,
                 )
-                progress = next_score - current_score
+                model_progress = next_score - current_score
+                subgoal_progress = self._subgoal_progress(action, self.goal)
+                progress = model_progress + subgoal_progress
                 location, raw_ig, discounted_ig, cost, revisit_cost = (
                     self._action_terms(action, self.belief)
                 )
+                no_progress_penalty = 0.0
+                if observation_unchanged and (
+                    action == previous_action
+                    or self._is_observation_action(action)
+                ):
+                    no_progress_penalty = self.revisit_penalty * 4.0
                 efe = (
                     -self.progress_weight * progress
                     - self.information_gain_weight * discounted_ig
                     + self.action_cost_weight * cost
                     + revisit_cost
+                    + no_progress_penalty
                 )
                 scored.append(
                     {
                         "action": action,
                         "efe": efe,
                         "predicted_progress": progress,
+                        "model_predicted_progress": model_progress,
+                        "subgoal_progress": subgoal_progress,
                         "expected_information_gain": discounted_ig,
                         "raw_expected_information_gain": raw_ig,
                         "estimated_step_cost": cost,
                         "revisit_penalty": revisit_cost,
+                        "no_progress_penalty": no_progress_penalty,
                         "probe_location": location,
                         "navigation_action": bool(
                             _GO_TO_RE.fullmatch(action.strip())
                         ),
                         "destination_previously_visited": bool(
-                            belief is not None
+                            self.belief is not None
                             and location is not None
-                            and location in belief.visited_locations
+                            and location in self.belief.visited_locations
                         ),
                         "destination_previously_inspected": bool(
-                            belief is not None
+                            self.belief is not None
                             and location is not None
-                            and location in belief.inspected_locations
+                            and location in self.belief.inspected_locations
                         ),
                         "policy_proposal": action == policy_response.action,
                         "candidate_order": index,
                     }
                 )
             best = min(scored, key=lambda item: item["efe"])
-            self._update_pending_probe(best)
+            policy_score = next(
+                (item for item in scored if item["action"] == policy_response.action),
+                None,
+            )
+            safe_scored = [
+                item
+                for item in scored
+                if not (
+                    observation_unchanged
+                    and (
+                        item["action"] == previous_action
+                        or self._is_observation_action(item["action"])
+                    )
+                )
+            ]
+            safe_best = min(safe_scored or scored, key=lambda item: item["efe"])
+
+            chosen = policy_score or safe_best
+            planner_status = "policy_preserved"
+            override_reason = "policy_first"
+            if policy_score is None:
+                chosen = safe_best
+                planner_status = "scored"
+                override_reason = "policy_not_in_candidates"
+            elif stalled:
+                policy_is_noop = (
+                    policy_repeated
+                    or (
+                        observation_unchanged
+                        and self._is_observation_action(policy_response.action)
+                    )
+                )
+                materially_better = (
+                    safe_best["efe"] + self.override_margin < policy_score["efe"]
+                    and safe_best["predicted_progress"] >= 0.0
+                )
+                if policy_is_noop:
+                    # A repeated observation/action pair must be broken even
+                    # when the learned model cannot produce positive progress.
+                    chosen = safe_best
+                    planner_status = "stalled_recovery"
+                    override_reason = "avoid_no_progress_action"
+                elif materially_better:
+                    chosen = safe_best
+                    planner_status = "scored"
+                    override_reason = "positive_margin_on_stall"
+                else:
+                    planner_status = "stalled_policy"
+                    override_reason = "policy_action_is_safe"
+            self._update_pending_probe(chosen)
             diagnostics = {
                 "planner": "efe_world_model",
-                "planner_status": "scored",
-                "chosen_action": best["action"],
+                "planner_status": planner_status,
+                "chosen_action": chosen["action"],
                 "policy_proposal": policy_response.action,
+                "previous_action": previous_action,
+                "observation_unchanged": observation_unchanged,
+                "stalled": stalled,
+                "override_reason": override_reason,
+                "efe_best_action": best["action"],
                 "belief_entropy_bits": (
                     self.belief.entropy_bits() if self.belief is not None else 0.0
                 ),
                 "current_goal_score": current_score,
-                "chosen_predicted_progress": best["predicted_progress"],
-                "expected_information_gain": best["expected_information_gain"],
-                "raw_expected_information_gain": best[
+                "chosen_predicted_progress": chosen["predicted_progress"],
+                "chosen_model_predicted_progress": chosen[
+                    "model_predicted_progress"
+                ],
+                "chosen_subgoal_progress": chosen["subgoal_progress"],
+                "expected_information_gain": chosen["expected_information_gain"],
+                "raw_expected_information_gain": chosen[
                     "raw_expected_information_gain"
                 ],
-                "estimated_step_cost": best["estimated_step_cost"],
-                "probe_location": best["probe_location"],
-                "navigation_action": best["navigation_action"],
-                "destination_previously_visited": best[
+                "estimated_step_cost": chosen["estimated_step_cost"],
+                "probe_location": chosen["probe_location"],
+                "navigation_action": chosen["navigation_action"],
+                "destination_previously_visited": chosen[
                     "destination_previously_visited"
                 ],
-                "destination_previously_inspected": best[
+                "destination_previously_inspected": chosen[
                     "destination_previously_inspected"
                 ],
-                "efe": best["efe"],
+                "efe": chosen["efe"],
+                "efe_best": best["efe"],
                 "candidate_scores": scored,
             }
             return AgentResponse(
-                action=best["action"],
+                action=chosen["action"],
                 raw_response=policy_response.raw_response,
                 user_prompt=policy_response.user_prompt,
                 diagnostics=diagnostics,
@@ -395,37 +591,94 @@ class EFEWorldModelAgent(LLMTextAgent):
         action: str,
         observation: str,
     ) -> dict[str, Any]:
-        if self.belief is None:
-            return {}
-        update = self.belief.record_observation(observation, action=action)
-        result: dict[str, Any] = {
-            "belief_entropy_before_transition": update["belief_entropy_before"],
-            "belief_entropy_after_transition": update["belief_entropy_after"],
-            "realized_information_gain": update["realized_information_gain"],
-            "inspected_location": update["inspected_location"],
-        }
-        inspected_location = update["inspected_location"]
-        if (
-            self._pending_probe is not None
-            and inspected_location == self._pending_probe["location"]
-        ):
-            probe_realized_ig = max(
-                0.0,
-                float(self._pending_probe["entropy_before"])
-                - float(update["belief_entropy_after"]),
-            )
+        result: dict[str, Any] = {}
+        if self.belief is not None:
+            update = self.belief.record_observation(observation, action=action)
             result.update(
                 {
-                    "probe_completed": True,
-                    "probe_location": inspected_location,
-                    "probe_planning_action": self._pending_probe["planning_action"],
-                    "probe_expected_information_gain": self._pending_probe[
-                        "expected_information_gain"
+                    "belief_entropy_before_transition": update[
+                        "belief_entropy_before"
                     ],
-                    "probe_realized_information_gain": probe_realized_ig,
+                    "belief_entropy_after_transition": update[
+                        "belief_entropy_after"
+                    ],
+                    "realized_information_gain": update["realized_information_gain"],
+                    "inspected_location": update["inspected_location"],
                 }
             )
-            self._pending_probe = None
-        else:
-            result["probe_completed"] = False
+            inspected_location = update["inspected_location"]
+            if (
+                self._pending_probe is not None
+                and inspected_location == self._pending_probe["location"]
+            ):
+                probe_realized_ig = max(
+                    0.0,
+                    float(self._pending_probe["entropy_before"])
+                    - float(update["belief_entropy_after"]),
+                )
+                result.update(
+                    {
+                        "probe_completed": True,
+                        "probe_location": inspected_location,
+                        "probe_planning_action": self._pending_probe[
+                            "planning_action"
+                        ],
+                        "probe_expected_information_gain": self._pending_probe[
+                            "expected_information_gain"
+                        ],
+                        "probe_realized_information_gain": probe_realized_ig,
+                    }
+                )
+                self._pending_probe = None
+            else:
+                result["probe_completed"] = False
+
+        if self.online_vfe:
+            self._online_vfe_transition_count += 1
+            if (
+                self._online_vfe_transition_count % self.online_vfe_update_interval
+                != 0
+            ):
+                result["online_vfe_update_skipped"] = True
+                self._last_observation = observation
+                return result
+            if self._last_observation is None:
+                self.online_vfe_errors += 1
+                result["online_vfe_error_type"] = "missing_previous_observation"
+            else:
+                try:
+                    update_metrics: dict[str, float] = {}
+                    for _ in range(self.online_vfe_steps):
+                        update_metrics = self.world_model.online_vfe_step(
+                            self._last_observation,
+                            action,
+                            observation,
+                            beta=self.online_vfe_beta,
+                            state_positive_weight=self.online_vfe_state_positive_weight,
+                            gradient_clip_norm=self.online_vfe_gradient_clip_norm,
+                        )
+                        self.online_vfe_updates += 1
+                        self.online_vfe_loss_sum += update_metrics["loss"]
+                    result.update(
+                        {
+                            "online_vfe_loss": update_metrics["loss"],
+                            "online_vfe_reconstruction": update_metrics[
+                                "reconstruction"
+                            ],
+                            "online_vfe_kl": update_metrics["kl"],
+                            "online_vfe_state_supervision": update_metrics[
+                                "state_supervision"
+                            ],
+                            "online_vfe_transition_supervision": update_metrics[
+                                "transition_supervision"
+                            ],
+                            "online_vfe_gradient_norm": update_metrics[
+                                "gradient_norm"
+                            ],
+                        }
+                    )
+                except Exception as exc:
+                    self.online_vfe_errors += 1
+                    result["online_vfe_error_type"] = type(exc).__name__
+        self._last_observation = observation
         return result

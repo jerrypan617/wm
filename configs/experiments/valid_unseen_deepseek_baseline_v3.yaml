@@ -1,0 +1,8 @@
+model_config: ../models/deepseek_reasoner.yaml
+environment_config: ../environments/alfworld_textworld.yaml
+split: valid_unseen
+num_episodes: -1
+action_space: admissible
+workers: 4
+output_dir: results/deepseek_reasoner/valid_unseen_baseline_v3
+

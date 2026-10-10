@@ -19,6 +19,7 @@ dependencies = [
     "datasets",
     "accelerate",
     "tqdm",
+    "tensorboard",
 ]
 
 [tool.uv]

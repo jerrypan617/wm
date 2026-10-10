@@ -27,8 +27,11 @@ def main() -> None:
 
     records = []
     seen: set[int] = set()
+    planner_stats: dict[str, int | float] = {}
+    planner_stats_shards = []
     for input_path in args.input:
-        for line in Path(input_path).read_text(encoding="utf-8").splitlines():
+        input_file = Path(input_path)
+        for line in input_file.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             payload = json.loads(line)
@@ -37,11 +40,22 @@ def main() -> None:
                 raise ValueError(f"Duplicate episode_id: {episode_id}")
             seen.add(episode_id)
             records.append(payload)
+        stats_path = input_file.with_name(
+            input_file.name.replace(".checkpoint.jsonl", ".planner_stats.json")
+        )
+        if stats_path.exists():
+            shard_stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            planner_stats_shards.append(str(stats_path))
+            for key, value in shard_stats.items():
+                if isinstance(value, (int, float)):
+                    planner_stats[key] = planner_stats.get(key, 0) + value
     records.sort(key=lambda item: int(item["episode_id"]))
     episode_results = [EpisodeResult(**record) for record in records]
     summary = summarize(episode_results)
     output_dir = Path(args.output_dir)
     write_jsonl(output_dir / f"{args.run_name}.jsonl", episode_results)
+    if planner_stats_shards:
+        write_json(output_dir / f"{args.run_name}.planner_stats.json", planner_stats)
     write_json(
         output_dir / f"{args.run_name}.summary.json",
         {
@@ -50,6 +64,8 @@ def main() -> None:
             "action_space": args.action_space,
             "max_steps": args.max_steps,
             "shards": list(args.input),
+            "planner_stats": planner_stats,
+            "planner_stats_shards": planner_stats_shards,
             **summary,
         },
     )

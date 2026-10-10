@@ -71,6 +71,13 @@ class AlfworldTextWorldEnv:
         self.split = split
         self.config = config
         self._alfworld = AlfredTWEnv(config, train_eval=SPLIT_TO_ALFWORLD[split])
+        # AlfredTWEnv builds ``game_files`` from os.walk(), whose traversal
+        # order is not part of its API.  Episode ids are positional in this
+        # adapter, so normalize the order before selecting a shard.  Without
+        # this, two runs of the same split can assign different games to the
+        # same episode id.
+        self._alfworld.game_files = sorted(self._alfworld.game_files)
+        self._alfworld.num_games = len(self._alfworld.game_files)
         available = self._alfworld.num_games
         if episode_indices is not None:
             indices = list(episode_indices)

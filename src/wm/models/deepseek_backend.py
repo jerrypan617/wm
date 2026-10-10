@@ -113,7 +113,22 @@ class DeepSeekBackend:
                 return self._extract_content(result)
             except HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")[:1000]
-                if exc.code not in {429, 500, 502, 503, 504} or attempt == self.max_retries:
+                # 520 is commonly returned by the proxy/API edge when the
+                # origin resets a request.  It is transient in the same way
+                # as the other gateway/server errors and must not abort a
+                # long-running evaluation whose checkpoint is otherwise
+                # healthy.
+                if exc.code not in {
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                    520,
+                    521,
+                    522,
+                    524,
+                } or attempt == self.max_retries:
                     raise RuntimeError(
                         f"DeepSeek API returned HTTP {exc.code}: {body}"
                     ) from exc
