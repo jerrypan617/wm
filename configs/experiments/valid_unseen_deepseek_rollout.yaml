@@ -1,0 +1,14 @@
+model_config: ../models/deepseek_reasoner.yaml
+environment_config: ../environments/alfworld_textworld.yaml
+split: valid_unseen
+num_episodes: -1
+action_space: admissible
+output_dir: results/deepseek_reasoner/valid_unseen_preference_rollout
+
+preference_rollout:
+  horizon: 3
+  max_root_candidates: 5
+  max_imagined_actions: 12
+  state_threshold: 0.5
+  state_entropy_penalty_weight: 0.0
+  judge_max_new_tokens: 768

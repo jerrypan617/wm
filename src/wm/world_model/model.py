@@ -641,3 +641,86 @@ class QwenWorldModel(nn.Module):
                 )
             )
         return predictions
+
+    @torch.no_grad()
+    def predict_from_state_probabilities(
+        self,
+        state_probabilities: Sequence[Sequence[float]] | torch.Tensor,
+        actions: Sequence[str],
+        *,
+        threshold: float = 0.5,
+        top_words: int = 20,
+    ) -> list[WorldModelPrediction]:
+        """Advance imagined Bernoulli states without re-encoding fake text.
+
+        Each row is the factorized state distribution produced by the
+        previous imagined step, paired with the action taken in that state.
+        The transition head was trained on posterior state probabilities, so
+        this lets multi-step rollouts recurse through the learned dynamics
+        directly instead of treating a decoded observation as ground truth.
+        """
+
+        if not actions:
+            return []
+        state_tensor = torch.as_tensor(
+            state_probabilities,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if state_tensor.ndim == 1:
+            if len(actions) != 1:
+                raise ValueError(
+                    "A single state distribution can only be paired with one action"
+                )
+            state_tensor = state_tensor.unsqueeze(0)
+        if state_tensor.ndim != 2:
+            raise ValueError("state_probabilities must have shape [batch, facts]")
+        if state_tensor.shape[0] != len(actions):
+            raise ValueError("state and action batch sizes must match")
+        if state_tensor.shape[1] != len(self.vocab.facts):
+            raise ValueError(
+                "state probability width must match the World Model fact vocabulary"
+            )
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be in [0, 1]")
+        if top_words < 0:
+            raise ValueError("top_words must be non-negative")
+
+        safe_state = state_tensor.clamp(1e-6, 1.0 - 1e-6)
+        state_logits = torch.logit(safe_state)
+        action_indices = torch.tensor(
+            [self.vocab.action_index(action) for action in actions],
+            dtype=torch.long,
+            device=self.device,
+        )
+        next_logits = self.transition_logits(state_logits, action_indices)
+        next_probabilities = torch.sigmoid(next_logits)
+        reconstructed = torch.sigmoid(
+            self.observation_decoder(next_probabilities)
+        )
+
+        predictions: list[WorldModelPrediction] = []
+        for row in range(len(actions)):
+            facts = [
+                fact
+                for index, fact in enumerate(self.vocab.facts)
+                if float(next_probabilities[row, index]) >= threshold
+            ]
+            ranked_words = torch.argsort(
+                reconstructed[row], descending=True
+            )[:top_words]
+            words = [
+                self.vocab.observation_words[int(index)]
+                for index in ranked_words
+            ]
+            predictions.append(
+                WorldModelPrediction(
+                    posterior_state_probabilities=state_tensor[row].detach().cpu(),
+                    predicted_next_state_probabilities=(
+                        next_probabilities[row].detach().cpu()
+                    ),
+                    predicted_facts=[facts],
+                    reconstructed_words=[words],
+                )
+            )
+        return predictions

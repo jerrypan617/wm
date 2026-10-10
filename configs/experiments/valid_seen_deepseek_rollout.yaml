@@ -1,0 +1,17 @@
+model_config: ../models/deepseek_reasoner.yaml
+environment_config: ../environments/alfworld_textworld.yaml
+split: valid_seen
+num_episodes: -1
+action_space: admissible
+output_dir: results/deepseek_reasoner/valid_seen_preference_rollout
+
+preference_rollout:
+  horizon: 3
+  max_root_candidates: 5
+  max_imagined_actions: 12
+  state_threshold: 0.5
+  # Optional conservative penalty on predictive state entropy, measured in
+  # normalized bits and multiplied into the preference score (0-100 scale).
+  # Keep at zero for the preference-prompt-only ablation.
+  state_entropy_penalty_weight: 0.0
+  judge_max_new_tokens: 768

@@ -128,6 +128,45 @@ useful engineering proxy, not a claim that the World Model has calibrated
 parameter uncertainty. The design and assumptions are documented in
 [`docs/architecture/adr-001-belief-aware-efe-planner.md`](docs/architecture/adr-001-belief-aware-efe-planner.md).
 
+## Preference-scored multi-step rollouts
+
+The separate preference-rollout experiment removes the explicit information-
+gain term. It compares a bounded set of currently admissible root actions,
+recursively advances the World Model's predicted fact distribution, asks the
+policy model to propose imagined continuations from those predicted states,
+and uses a trajectory-evaluation prompt to score the resulting paths. Only
+the best path's first action is executed; the next real observation starts a
+new planning cycle. Imagined trajectories are planning evidence, not labels
+for updating the World Model.
+
+The continuation policy is constrained to actions in the World Model's
+training vocabulary and grounded against entities in the predicted facts.
+That is a practical approximation rather than an exact simulator-provided
+admissible-action list; later imagined actions are never sent to ALFWorld.
+The current text backend does not expose action probabilities, so policy
+action entropy is not estimated. Mean factorized-state entropy is logged and
+can optionally act as a conservative score penalty; it is not information
+gain. The optional score is
+`trajectory_score = preference_prompt_score - lambda * mean_state_entropy`;
+keep `lambda=0` for the preference-only experiment.
+
+Run a small matched evaluation first:
+
+```bash
+uv run python scripts/run_rollout_eval.py \
+  --config configs/experiments/valid_seen_deepseek_rollout.yaml \
+  --world-model-checkpoint checkpoints/qwen35_world_model_qlora_train200_v2_pos10.pt \
+  --cache-dir cache \
+  --num-episodes 5
+```
+
+Add `--resume` to continue from the per-episode checkpoint after an interrupted
+run.
+
+The default horizon is three predicted transitions. Each decision adds a
+batched continuation-policy call per imagined depth and one trajectory-judge
+call, so compare API cost and latency alongside success and step metrics.
+
 Train the World Model on the ALFWorld `train` split and keep validation splits
 held out. The trainer now assigns complete episodes to either train or
 validation, avoiding leakage between adjacent transitions. It also builds the

@@ -9,6 +9,7 @@ from .llm_agent import (
     WorldModelGuidedLLMTextAgent,
 )
 from .efe_agent import EFEWorldModelAgent
+from .trajectory_agent import PreferenceRolloutAgent
 
 __all__ = [
     "AgentResponse",
@@ -16,6 +17,7 @@ __all__ = [
     "StructuredLLMTextAgent",
     "WorldModelGuidedLLMTextAgent",
     "EFEWorldModelAgent",
+    "PreferenceRolloutAgent",
     "StructuredALFWorldAgent",
     "WorldModelGuidedStructuredAgent",
 ]
